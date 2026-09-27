@@ -107,4 +107,53 @@ describe("listSourceFiles covers everything parse reads", () => {
       expect(listed).toContain(path);
     }
   });
+
+  it("snow", async () => {
+    const usage = join(mocks.home, ".snow", "usage", "2026-07-11");
+    const sessions = join(
+      mocks.home,
+      ".snow",
+      "sessions",
+      "demo-abc123",
+      "20260711",
+    );
+    const subagents = join(sessions, "subagent");
+
+    mkdirSync(usage, { recursive: true });
+    writeJsonl(join(usage, "usage-001.jsonl"), [
+      {
+        model: "gpt-5",
+        inputTokens: 10,
+        outputTokens: 2,
+        timestamp: "2026-07-11T13:10:00.000Z",
+      },
+    ]);
+    mkdirSync(subagents, { recursive: true });
+    writeFileSync(
+      join(sessions, "session-1.json"),
+      JSON.stringify({
+        id: "session-1",
+        projectPath: "/code/demo",
+        messages: [{ role: "user", timestamp: 1783785917983 }],
+      }),
+    );
+    // The subagent directory is skipped by the parser, so it must not appear in
+    // the list either.
+    writeFileSync(
+      join(subagents, "session-1.json"),
+      JSON.stringify([{ id: "sub-1", messages: [] }]),
+    );
+
+    const { SnowParser } = await import("../parsers/snow");
+    const parser = new SnowParser(join(mocks.home, ".snow"));
+
+    readPaths.length = 0;
+    await parser.parse();
+    const listed = new Set(parser.listSourceFiles());
+
+    expect(readPaths.length).toBeGreaterThan(0);
+    for (const path of readPaths) {
+      expect(listed).toContain(path);
+    }
+  });
 });

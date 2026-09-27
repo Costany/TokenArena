@@ -12,15 +12,21 @@ import { findJsonlFiles, readFileSafe } from "../infrastructure/fs/utils";
 import { registerParser } from "./registry";
 import type { IParser, ToolDefinition } from "./types";
 
-const DEFAULT_HOME_DIR = join(homedir(), ".snow");
+const DEFAULT_SNOW_DIR = join(homedir(), ".snow");
 const USAGE_DIR_NAME = "usage";
 const SESSIONS_DIR_NAME = "sessions";
 
 /**
- * Snow writes per-request token usage to JSONL files without a session id, and
- * keeps transcripts in a separate tree of session JSON files. Usage records are
- * therefore attributed to the session whose transcript was active at that
- * moment, using the closest surrounding transcript.
+ * Snow writes per-request token usage to JSONL records that carry no session
+ * id, and keeps transcripts in a separate tree of session files. Usage records
+ * are attributed to the transcript that was most likely producing them, which
+ * is decided from message timestamps alone.
+ *
+ * Attribution is deliberately kept off the buckets. Bucket keys include the
+ * project, and the server upserts without deleting, so moving a bucket between
+ * projects would leave the old rows behind forever and inflate totals on every
+ * re-attribution. Sessions are keyed by `sessionHash` and simply overwritten, so
+ * they can absorb an approximate project without growing the remote data.
  */
 const SESSION_MATCH_WINDOW_MS = 5 * 60 * 1000;
 
@@ -43,18 +49,22 @@ interface SnowSessionFile {
   id?: unknown;
   projectPath?: unknown;
   messages?: unknown;
+  compressedFrom?: unknown;
+  compressedAt?: unknown;
 }
 
 interface SnowSessionWindow {
   sessionId: string;
   project: string;
-  /** First user/assistant message time, used to rank attribution candidates. */
-  firstMessage: number;
-  /** Last user/assistant message time, used to rank attribution candidates. */
-  lastMessage: number;
-  /** Padded match window around the message range. */
+  /**
+   * Timestamps of assistant messages in this transcript. A usage record is
+   * written after the response stream closes, so the assistant reply that
+   * caused it is the closest one in time.
+   */
+  assistantTimes: number[];
+  /** Padded match window around the whole message range. */
   start: number;
-  /** Padded match window around the message range. */
+  /** Padded match window around the whole message range. */
   end: number;
 }
 
@@ -73,8 +83,11 @@ function toTimestamp(value: unknown): Date | null {
 }
 
 /**
- * Recursively collect Snow session files, skipping `subagent` mirrors that
- * repeat the parent transcript under the same session id.
+ * Recursively collect Snow session files.
+ *
+ * `subagent/` holds a `SubAgentSessionRecord` array describing sub-agent runs
+ * rather than a copy of the parent transcript. Its usage is already recorded in
+ * the global usage log, so the directory is skipped to avoid double counting.
  */
 function findSessionFiles(dir: string, results: string[] = []): string[] {
   if (!existsSync(dir)) return results;
@@ -100,11 +113,15 @@ function findSessionFiles(dir: string, results: string[] = []): string[] {
 }
 
 /**
- * Choose the transcript that best explains a usage timestamp.
+ * Choose the transcript that most likely produced a usage record.
  *
- * Several Snow sessions can overlap in time, so the first match would attribute
- * tokens to an arbitrary session. Picking the smallest distance to the session
- * message range keeps attribution deterministic.
+ * Distance is measured to the nearest assistant message, because Snow stamps a
+ * usage record once the response stream closes. Ties fall back to the session id
+ * so repeated syncs on different machines agree on the same assignment.
+ *
+ * A transcript without any assistant reply (for example an interrupted prompt)
+ * is the weakest candidate, so it keeps an infinite distance and only wins when
+ * no transcript with a reply overlaps the record.
  */
 function findClosestWindow(
   windows: SnowSessionWindow[],
@@ -115,13 +132,20 @@ function findClosestWindow(
 
   for (const window of windows) {
     if (time < window.start || time > window.end) continue;
-    const distance =
-      time < window.firstMessage
-        ? window.firstMessage - time
-        : time > window.lastMessage
-          ? time - window.lastMessage
-          : 0;
-    if (distance < bestDistance) {
+
+    let distance = Number.POSITIVE_INFINITY;
+    for (const assistantTime of window.assistantTimes) {
+      const delta = Math.abs(time - assistantTime);
+      if (delta < distance) distance = delta;
+    }
+
+    if (
+      best === undefined ||
+      distance < bestDistance ||
+      (distance === bestDistance &&
+        best !== undefined &&
+        window.sessionId < best.sessionId)
+    ) {
       best = window;
       bestDistance = distance;
     }
@@ -130,9 +154,15 @@ function findClosestWindow(
   return best;
 }
 
+/**
+ * `basename` on POSIX does not treat a backslash as a separator, so a Windows
+ * path would be returned whole. Snow always records native paths, so normalise
+ * both separators before taking the last segment.
+ */
 function resolveProject(session: SnowSessionFile): string {
   if (typeof session.projectPath === "string" && session.projectPath) {
-    return basename(session.projectPath) || "unknown";
+    const segments = session.projectPath.split(/[\\/]+/).filter(Boolean);
+    return segments.at(-1) || "unknown";
   }
   return "unknown";
 }
@@ -140,11 +170,11 @@ function resolveProject(session: SnowSessionFile): string {
 export class SnowParser implements IParser {
   readonly tool: ToolDefinition;
 
-  constructor(private readonly homeDir = DEFAULT_HOME_DIR) {
+  constructor(private readonly snowDir = DEFAULT_SNOW_DIR) {
     this.tool = {
       id: "snow",
       name: "Snow CLI",
-      dataDir: join(homeDir, USAGE_DIR_NAME),
+      dataDir: join(snowDir, USAGE_DIR_NAME),
     };
   }
 
@@ -160,15 +190,15 @@ export class SnowParser implements IParser {
 
   listSourceFiles(): string[] {
     return [
-      ...findJsonlFiles(join(this.homeDir, USAGE_DIR_NAME)),
-      ...findSessionFiles(join(this.homeDir, SESSIONS_DIR_NAME)),
+      ...findJsonlFiles(join(this.snowDir, USAGE_DIR_NAME)),
+      ...findSessionFiles(join(this.snowDir, SESSIONS_DIR_NAME)),
     ];
   }
 
   /**
    * Build session timing events plus the windows used to attribute usage
    * records. Message timestamps drive turn boundaries, so active time, session
-   * duration, and message counts all come from real Snow transcripts.
+   * duration, and message counts all come from real transcripts.
    */
   private parseSessions(): {
     events: SessionEvent[];
@@ -178,7 +208,7 @@ export class SnowParser implements IParser {
     const windows: SnowSessionWindow[] = [];
 
     for (const filePath of findSessionFiles(
-      join(this.homeDir, SESSIONS_DIR_NAME),
+      join(this.snowDir, SESSIONS_DIR_NAME),
     )) {
       const content = readFileSafe(filePath);
       if (!content) continue;
@@ -201,8 +231,17 @@ export class SnowParser implements IParser {
         ? (session.messages as SnowSessionMessage[])
         : [];
 
+      // `/compact` creates a new session that replays recent turns with their
+      // timestamps rewritten to the compaction moment. Those replayed messages
+      // already exist in the original transcript, so counting them again would
+      // inflate message counts, active time, and user prompt hours.
+      const compactedAt =
+        typeof session.compressedAt === "number" ? session.compressedAt : null;
+      const isCompacted = typeof session.compressedFrom === "string";
+
       let start = Number.POSITIVE_INFINITY;
       let end = Number.NEGATIVE_INFINITY;
+      const assistantTimes: number[] = [];
 
       for (const message of messages) {
         if (!message || typeof message !== "object") continue;
@@ -210,6 +249,10 @@ export class SnowParser implements IParser {
 
         const timestamp = toTimestamp(message.timestamp);
         if (!timestamp) continue;
+
+        const time = timestamp.getTime();
+        if (isCompacted && compactedAt !== null && time <= compactedAt)
+          continue;
 
         events.push({
           sessionId,
@@ -219,7 +262,7 @@ export class SnowParser implements IParser {
           role: message.role,
         });
 
-        const time = timestamp.getTime();
+        if (message.role === "assistant") assistantTimes.push(time);
         if (time < start) start = time;
         if (time > end) end = time;
       }
@@ -233,8 +276,7 @@ export class SnowParser implements IParser {
       windows.push({
         sessionId,
         project,
-        firstMessage: start,
-        lastMessage: end,
+        assistantTimes,
         start: start - SESSION_MATCH_WINDOW_MS,
         end: end + SESSION_MATCH_WINDOW_MS,
       });
@@ -246,12 +288,14 @@ export class SnowParser implements IParser {
   /**
    * Parse usage JSONL and attach each record to the session that was active at
    * that moment, so session rows report real token totals instead of zeros.
+   *
+   * The bucket project stays `unknown` on purpose; see the note on
+   * `SESSION_MATCH_WINDOW_MS`.
    */
   private parseUsage(windows: SnowSessionWindow[]): TokenUsageEntry[] {
     const entries: TokenUsageEntry[] = [];
-    const sortedWindows = [...windows];
 
-    for (const filePath of findJsonlFiles(join(this.homeDir, USAGE_DIR_NAME))) {
+    for (const filePath of findJsonlFiles(join(this.snowDir, USAGE_DIR_NAME))) {
       const content = readFileSafe(filePath);
       if (!content) continue;
 
@@ -286,7 +330,7 @@ export class SnowParser implements IParser {
         )
           continue;
 
-        const window = findClosestWindow(sortedWindows, timestamp.getTime());
+        const window = findClosestWindow(windows, timestamp.getTime());
 
         entries.push({
           sessionId: window?.sessionId,
@@ -295,7 +339,7 @@ export class SnowParser implements IParser {
             typeof record.model === "string" && record.model
               ? record.model
               : "unknown",
-          project: window?.project ?? "unknown",
+          project: "unknown",
           timestamp,
           inputTokens,
           outputTokens,
@@ -310,7 +354,7 @@ export class SnowParser implements IParser {
   }
 
   isInstalled(): boolean {
-    return existsSync(join(this.homeDir, USAGE_DIR_NAME));
+    return existsSync(join(this.snowDir, USAGE_DIR_NAME));
   }
 }
 
