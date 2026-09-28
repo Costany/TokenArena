@@ -8,7 +8,7 @@ import type {
   SessionEvent,
   TokenUsageEntry,
 } from "../domain/types";
-import { findJsonlFiles, readFileSafe } from "../infrastructure/fs/utils";
+import { readFileSafe } from "../infrastructure/fs/utils";
 import { registerParser } from "./registry";
 import type { IParser, ToolDefinition } from "./types";
 
@@ -69,6 +69,7 @@ interface SnowSessionWindow {
 }
 
 function toNonNegativeNumber(value: unknown): number {
+  if (typeof value !== "number" && typeof value !== "string") return 0;
   const numberValue = Number(value);
   return Number.isFinite(numberValue) && numberValue >= 0 ? numberValue : 0;
 }
@@ -79,32 +80,44 @@ function toTimestamp(value: unknown): Date | null {
     return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  return new Date(value < 100_000_000_000 ? value * 1000 : value);
+  const parsed = new Date(value < 100_000_000_000 ? value * 1000 : value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
- * Recursively collect Snow session files.
+ * Recursively collect Snow usage or session files.
  *
  * `subagent/` holds a `SubAgentSessionRecord` array describing sub-agent runs
  * rather than a copy of the parent transcript. Its usage is already recorded in
  * the global usage log, so the directory is skipped to avoid double counting.
  */
-function findSessionFiles(dir: string, results: string[] = []): string[] {
-  if (!existsSync(dir)) return results;
-
+function findSourceFiles(
+  dir: string,
+  extension: ".json" | ".jsonl",
+  results: string[] = [],
+  optionalRoot = true,
+): string[] {
   let entries: Dirent[];
   try {
     entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return results;
+  } catch (error) {
+    // 尚未使用 Snow 时根目录可以不存在；扫描中断必须交给同步层暂缓该源。
+    if (optionalRoot && (error as NodeJS.ErrnoException).code === "ENOENT") {
+      return results;
+    }
+    throw error;
   }
 
   for (const entry of entries) {
     const fullPath = join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (entry.name === "subagent") continue;
-      findSessionFiles(fullPath, results);
-    } else if (entry.name.endsWith(".json")) {
+      if (extension === ".json" && entry.name === "subagent") continue;
+      findSourceFiles(fullPath, extension, results, false);
+    } else if (entry.name.endsWith(extension)) {
       results.push(fullPath);
     }
   }
@@ -179,19 +192,20 @@ export class SnowParser implements IParser {
   }
 
   async parse(): Promise<ParseResult> {
-    const { events, windows } = this.parseSessions();
-    const entries = this.parseUsage(windows);
+    const sessions = this.parseSessions();
+    const usage = this.parseUsage(sessions.windows);
 
     return {
-      buckets: aggregateToBuckets(entries),
-      sessions: extractSessions(events, entries),
+      buckets: aggregateToBuckets(usage.entries),
+      sessions: extractSessions(sessions.events, usage.entries),
+      ...(sessions.incomplete || usage.incomplete ? { incomplete: true } : {}),
     };
   }
 
   listSourceFiles(): string[] {
     return [
-      ...findJsonlFiles(join(this.snowDir, USAGE_DIR_NAME)),
-      ...findSessionFiles(join(this.snowDir, SESSIONS_DIR_NAME)),
+      ...findSourceFiles(join(this.snowDir, USAGE_DIR_NAME), ".jsonl"),
+      ...findSourceFiles(join(this.snowDir, SESSIONS_DIR_NAME), ".json"),
     ];
   }
 
@@ -203,20 +217,32 @@ export class SnowParser implements IParser {
   private parseSessions(): {
     events: SessionEvent[];
     windows: SnowSessionWindow[];
+    incomplete: boolean;
   } {
     const events: SessionEvent[] = [];
     const windows: SnowSessionWindow[] = [];
+    let incomplete = false;
 
-    for (const filePath of findSessionFiles(
+    for (const filePath of findSourceFiles(
       join(this.snowDir, SESSIONS_DIR_NAME),
+      ".json",
     )) {
       const content = readFileSafe(filePath);
-      if (!content) continue;
+      if (!content) {
+        incomplete = true;
+        continue;
+      }
 
       let session: SnowSessionFile;
       try {
-        session = JSON.parse(content) as SnowSessionFile;
+        const parsed: unknown = JSON.parse(content);
+        if (!isRecord(parsed) || !Array.isArray(parsed.messages)) {
+          incomplete = true;
+          continue;
+        }
+        session = parsed;
       } catch {
+        incomplete = true;
         continue;
       }
 
@@ -282,7 +308,7 @@ export class SnowParser implements IParser {
       });
     }
 
-    return { events, windows };
+    return { events, windows, incomplete };
   }
 
   /**
@@ -292,19 +318,31 @@ export class SnowParser implements IParser {
    * The bucket project stays `unknown` on purpose; see the note on
    * `SESSION_MATCH_WINDOW_MS`.
    */
-  private parseUsage(windows: SnowSessionWindow[]): TokenUsageEntry[] {
+  private parseUsage(windows: SnowSessionWindow[]): {
+    entries: TokenUsageEntry[];
+    incomplete: boolean;
+  } {
     const entries: TokenUsageEntry[] = [];
+    let incomplete = false;
 
-    for (const filePath of findJsonlFiles(join(this.snowDir, USAGE_DIR_NAME))) {
+    for (const filePath of findSourceFiles(
+      join(this.snowDir, USAGE_DIR_NAME),
+      ".jsonl",
+    )) {
       const content = readFileSafe(filePath);
-      if (!content) continue;
+      if (content === null) {
+        incomplete = true;
+        continue;
+      }
 
       for (const line of content.split("\n")) {
         if (!line.trim()) continue;
 
         let record: SnowUsageRecord;
         try {
-          record = JSON.parse(line) as SnowUsageRecord;
+          const parsed: unknown = JSON.parse(line);
+          if (!isRecord(parsed)) continue;
+          record = parsed;
         } catch {
           // Ignore malformed or partially written JSONL records.
           continue;
@@ -350,7 +388,7 @@ export class SnowParser implements IParser {
       }
     }
 
-    return entries;
+    return { entries, incomplete };
   }
 
   isInstalled(): boolean {

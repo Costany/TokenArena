@@ -1,10 +1,24 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSafe } from "../infrastructure/fs/utils";
 import { useTempDirs } from "../testing/temp-dir";
 import { SnowParser } from "./snow";
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, readdirSync: vi.fn(actual.readdirSync) };
+});
+
+vi.mock("../infrastructure/fs/utils", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../infrastructure/fs/utils")>();
+  return { ...actual, readFileSafe: vi.fn(actual.readFileSafe) };
+});
+
 const makeTempDir = useTempDirs("tokenarena-snow-");
+
+afterEach(() => vi.resetAllMocks());
 
 /**
  * Fixtures use POSIX paths on purpose: `basename` on a POSIX runner does not
@@ -34,6 +48,158 @@ function writeSession(
 }
 
 describe("SnowParser", () => {
+  it("isolates invalid usage records without losing valid usage", async () => {
+    const snowDir = createSnowDir();
+    const usage = {
+      model: "gpt-5",
+      inputTokens: 100,
+      outputTokens: 10,
+      timestamp: "2026-07-11T13:10:00Z",
+    };
+    writeUsage(snowDir, "2026-07-11", [
+      "null",
+      "[]",
+      "42",
+      '"text"',
+      "{partial",
+      JSON.stringify({ ...usage, timestamp: 1e20 }),
+      JSON.stringify({ ...usage, timestamp: -1e20 }),
+      JSON.stringify({
+        ...usage,
+        inputTokens: { toString: 0, valueOf: 0 },
+        outputTokens: 0,
+      }),
+      JSON.stringify(usage),
+    ]);
+
+    const result = await new SnowParser(snowDir).parse();
+
+    expect(result.buckets).toHaveLength(1);
+    expect(result.buckets[0].totalTokens).toBe(110);
+    expect(result.incomplete).not.toBe(true);
+  });
+
+  it.each([
+    null,
+    [],
+    42,
+    {},
+    { messages: "broken" },
+  ])("marks an invalid session document as incomplete: %j", async (document) => {
+    const snowDir = createSnowDir();
+    writeSession(snowDir, "demo", "2026-07-11", "bad", document);
+    writeUsage(snowDir, "2026-07-11", [
+      JSON.stringify({
+        model: "gpt-5",
+        inputTokens: 100,
+        timestamp: "2026-07-11T13:10:00Z",
+      }),
+    ]);
+
+    const result = await new SnowParser(snowDir).parse();
+
+    expect(result.incomplete).toBe(true);
+    expect(result.buckets[0].totalTokens).toBe(100);
+  });
+
+  it("ignores out-of-range message timestamps", async () => {
+    const snowDir = createSnowDir();
+    writeSession(snowDir, "demo", "2026-07-11", "session", {
+      messages: [
+        { role: "user", timestamp: 1e20 },
+        { role: "assistant", timestamp: -1e20 },
+        { role: "user", timestamp: "2026-07-11T13:10:00Z" },
+        { role: "assistant", timestamp: "2026-07-11T13:10:10Z" },
+      ],
+    });
+
+    const result = await new SnowParser(snowDir).parse();
+
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0]).toMatchObject({
+      messageCount: 2,
+      durationSeconds: 10,
+    });
+  });
+
+  it("defers a truncated transcript and resumes normal attribution after repair", async () => {
+    const snowDir = createSnowDir();
+    const timestamp = Date.parse("2026-07-11T13:10:00Z");
+    const first = {
+      id: "a",
+      projectPath: "/code/a",
+      messages: [
+        { role: "user", timestamp: timestamp - 1000 },
+        { role: "assistant", timestamp },
+      ],
+    };
+    writeSession(snowDir, "demo", "2026-07-11", "a", first);
+    writeSession(snowDir, "demo", "2026-07-11", "b", {
+      id: "b",
+      projectPath: "/code/b",
+      messages: [
+        { role: "user", timestamp: timestamp + 29_000 },
+        { role: "assistant", timestamp: timestamp + 30_000 },
+      ],
+    });
+    writeUsage(snowDir, "2026-07-11", [
+      JSON.stringify({
+        model: "gpt-5",
+        inputTokens: 100,
+        outputTokens: 10,
+        timestamp,
+      }),
+    ]);
+    const parser = new SnowParser(snowDir);
+    const before = await parser.parse();
+    expect(before.sessions.find((s) => s.project === "a")?.totalTokens).toBe(
+      110,
+    );
+
+    writeFileSync(
+      join(snowDir, "sessions", "demo", "2026-07-11", "a.json"),
+      "{",
+    );
+    expect((await parser.parse()).incomplete).toBe(true);
+
+    writeSession(snowDir, "demo", "2026-07-11", "a", first);
+    const recovered = await parser.parse();
+    expect(recovered.incomplete).not.toBe(true);
+    expect(recovered.sessions).toEqual(before.sessions);
+  });
+
+  it.each(["sessions", "usage"])("defers unreadable %s files", async (kind) => {
+    const snowDir = createSnowDir();
+    if (kind === "sessions") {
+      writeSession(snowDir, "demo", "2026-07-11", "a", { messages: [] });
+    } else {
+      writeUsage(snowDir, "2026-07-11", ["{}"]);
+    }
+    vi.mocked(readFileSafe).mockReturnValueOnce(null);
+
+    expect((await new SnowParser(snowDir).parse()).incomplete).toBe(true);
+  });
+
+  it("propagates directory read failures instead of treating them as empty scans", async () => {
+    const parser = new SnowParser(createSnowDir());
+    const error = Object.assign(new Error("Access denied"), { code: "EACCES" });
+    vi.mocked(readdirSync).mockImplementationOnce(() => {
+      throw error;
+    });
+    expect(() => parser.listSourceFiles()).toThrow(error);
+    vi.mocked(readdirSync).mockImplementationOnce(() => {
+      throw error;
+    });
+    await expect(parser.parse()).rejects.toThrow(error);
+  });
+
+  it("accepts missing roots and empty usage files", async () => {
+    const snowDir = createSnowDir();
+    const parser = new SnowParser(snowDir);
+    expect(await parser.parse()).toEqual({ buckets: [], sessions: [] });
+    writeUsage(snowDir, "2026-07-11", []);
+    expect(await parser.parse()).toEqual({ buckets: [], sessions: [] });
+  });
   it("parses usage JSONL and ignores malformed records", async () => {
     const snowDir = createSnowDir();
     writeUsage(snowDir, "2026-07-11", [
@@ -368,7 +534,7 @@ describe("SnowParser", () => {
     expect(result.sessions[0].messageCount).toBe(1);
   });
 
-  it("skips session files that are not valid JSON", async () => {
+  it("marks session files that are not valid JSON as incomplete", async () => {
     const snowDir = createSnowDir();
     const dayDir = join(snowDir, "sessions", "demo-abc123", "2026-07-11");
     mkdirSync(dayDir, { recursive: true });
@@ -378,6 +544,7 @@ describe("SnowParser", () => {
 
     expect(result.sessions).toEqual([]);
     expect(result.buckets).toEqual([]);
+    expect(result.incomplete).toBe(true);
   });
 
   it("lists every file the parser reads", async () => {
