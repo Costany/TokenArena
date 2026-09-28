@@ -153,7 +153,7 @@ describe("groupByHourOrDay", () => {
     });
 
     const key = groupByHourOrDay(range, new Date("2026-03-26T08:45:00.000Z"));
-    expect(key).toBe("2026-03-26 08:00");
+    expect(key).toBe("2026-03-26T08:00:00.000Z");
   });
 
   it("groups by day when range granularity is day", () => {
@@ -169,6 +169,168 @@ describe("groupByHourOrDay", () => {
 });
 
 describe("listRangeBuckets", () => {
+  it.each([
+    { timezone: "Europe/Berlin", date: "2026-03-29", count: 23 },
+    { timezone: "Europe/Berlin", date: "2026-10-25", count: 25 },
+    { timezone: "America/New_York", date: "2026-03-08", count: 23 },
+    { timezone: "America/New_York", date: "2026-11-01", count: 25 },
+  ])("advances through $date in $timezone", ({ timezone, date, count }) => {
+    const range = resolveDashboardRange({
+      preset: "custom",
+      from: date,
+      to: date,
+      timezone,
+    });
+
+    const buckets = listRangeBuckets(range);
+
+    expect(buckets).toHaveLength(count);
+    expect(new Set(buckets.map((bucket) => bucket.key)).size).toBe(count);
+    expect(buckets[0]?.start.getTime()).toBe(range.from.getTime());
+    expect(buckets.at(-1)?.start.getTime()).toBe(
+      range.to.getTime() + 1 - 60 * 60 * 1000,
+    );
+    for (let index = 1; index < buckets.length; index++) {
+      expect(
+        buckets[index].start.getTime() - buckets[index - 1].start.getTime(),
+      ).toBe(60 * 60 * 1000);
+    }
+  });
+
+  it.each([
+    "2026-11-01T05:30:45.123Z",
+    "2026-11-01T06:30:45.123Z",
+  ])("keeps the correct occurrence of an ambiguous starting hour at %s", (from) => {
+    const range = resolveDashboardRange({
+      preset: "custom",
+      from,
+      to: new Date(new Date(from).getTime() + 15 * 60 * 1000),
+      timezone: "America/New_York",
+    });
+
+    const buckets = listRangeBuckets(range);
+
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0].start.toISOString()).toBe(
+      from.replace("30:45.123", "00:00.000"),
+    );
+    expect(buckets[0].label).toBe("2026-11-01 01:00");
+  });
+
+  it("keeps both occurrences of a repeated hour apart", () => {
+    const range = resolveDashboardRange({
+      preset: "custom",
+      from: "2026-11-01",
+      to: "2026-11-01",
+      timezone: "America/New_York",
+    });
+    const keys = new Set(listRangeBuckets(range).map((bucket) => bucket.key));
+
+    // Both are 01:30 on the wall clock, an hour apart. Trends seed a map by key,
+    // so a shared key would add the two hours together again.
+    const first = groupByHourOrDay(range, new Date("2026-11-01T05:30:00.000Z"));
+    const second = groupByHourOrDay(
+      range,
+      new Date("2026-11-01T06:30:00.000Z"),
+    );
+    expect(first).not.toBe(second);
+    expect(keys).toContain(first);
+    expect(keys).toContain(second);
+    expect(
+      listRangeBuckets(range).filter(
+        (bucket) => bucket.label === "2026-11-01 01:00",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it.each([
+    // 02:45 jumps to 03:45, off the hour grid.
+    { timezone: "Pacific/Chatham", from: "2026-09-27", to: "2026-09-27" },
+    // 02:00 jumps to 02:30, and the range starts inside the short hour.
+    {
+      timezone: "Australia/Lord_Howe",
+      from: "2026-10-03T15:45:00.000Z",
+      to: "2026-10-03T20:00:00.000Z",
+    },
+    // 02:00 falls back to 01:30, repeating half an hour.
+    { timezone: "Australia/Lord_Howe", from: "2027-04-04", to: "2027-04-04" },
+  ])("has a bucket for every moment of $from in $timezone", ({
+    timezone,
+    from,
+    to,
+  }) => {
+    const range = resolveDashboardRange({
+      preset: "custom",
+      from,
+      to,
+      timezone,
+    });
+    const buckets = listRangeBuckets(range);
+    const keys = new Set(buckets.map((bucket) => bucket.key));
+
+    expect(keys.size).toBe(buckets.length);
+    for (
+      let time = range.from.getTime();
+      time <= range.to.getTime();
+      time += 60 * 1000
+    ) {
+      expect(keys).toContain(groupByHourOrDay(range, new Date(time)));
+    }
+  });
+
+  it("labels an hour that starts after a half-hour jump by its own hour", () => {
+    const range = resolveDashboardRange({
+      preset: "custom",
+      from: "2026-10-03T15:45:00.000Z",
+      to: "2026-10-03T16:30:00.000Z",
+      timezone: "Australia/Lord_Howe",
+    });
+
+    expect(listRangeBuckets(range).map((bucket) => bucket.label)).toEqual([
+      "2026-10-04 02:00",
+      "2026-10-04 03:00",
+    ]);
+  });
+
+  it.each([
+    { timezone: "Africa/Cairo", now: "2026-04-27T09:00:00.000Z" },
+    { timezone: "Asia/Beirut", now: "2026-03-31T09:00:00.000Z" },
+  ])("keeps today in a 7d range after $timezone skips midnight", ({
+    timezone,
+    now,
+  }) => {
+    const range = resolveDashboardRange({
+      preset: "7d",
+      timezone,
+      now: new Date(now),
+    });
+    const keys = listRangeBuckets(range).map((bucket) => bucket.key);
+
+    expect(keys).toHaveLength(7);
+    expect(new Set(keys).size).toBe(7);
+    expect(keys.at(-1)).toBe(now.slice(0, 10));
+  });
+
+  it("starts a day without a midnight at the hour that replaces it", () => {
+    // Cairo moves from 00:00 straight to 01:00 on 2026-04-24.
+    const today = resolveDashboardRange({
+      preset: "1d",
+      timezone: "Africa/Cairo",
+      now: new Date("2026-04-24T09:00:00.000Z"),
+    });
+    const custom = resolveDashboardRange({
+      preset: "custom",
+      from: "2026-04-24",
+      to: "2026-04-24",
+      timezone: "Africa/Cairo",
+    });
+
+    expect(today.from.toISOString()).toBe("2026-04-23T22:00:00.000Z");
+    expect(listRangeBuckets(today)[0]?.label).toBe("2026-04-24 01:00");
+    expect(custom.from.toISOString()).toBe("2026-04-23T22:00:00.000Z");
+    expect(custom.to.toISOString()).toBe("2026-04-24T20:59:59.999Z");
+  });
+
   it("generates hourly buckets for a 1d range", () => {
     const range = resolveDashboardRange({
       preset: "1d",
@@ -179,8 +341,11 @@ describe("listRangeBuckets", () => {
     const buckets = listRangeBuckets(range);
 
     expect(buckets.length).toBe(6);
-    expect(buckets[0]?.key).toBe("2026-03-26 00:00");
-    expect(buckets[5]?.key).toBe("2026-03-26 05:00");
+    expect(buckets[0]).toMatchObject({
+      key: "2026-03-26T00:00:00.000Z",
+      label: "2026-03-26 00:00",
+    });
+    expect(buckets[5]?.label).toBe("2026-03-26 05:00");
   });
 
   it("generates daily buckets for a 7d range", () => {

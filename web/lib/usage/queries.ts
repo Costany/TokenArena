@@ -434,7 +434,7 @@ function buildTokenTrend(
     listRangeBuckets(input.range).map((bucket) => [
       bucket.key,
       {
-        label: bucket.key,
+        label: bucket.label,
         start: bucket.start.toISOString(),
         totalTokens: 0,
         inputTokens: 0,
@@ -492,7 +492,7 @@ function buildActivityTrend(
     listRangeBuckets(input.range).map((bucket) => [
       bucket.key,
       {
-        label: bucket.key,
+        label: bucket.label,
         start: bucket.start.toISOString(),
         activeSeconds: 0,
         totalSeconds: 0,

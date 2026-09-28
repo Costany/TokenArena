@@ -419,6 +419,7 @@ async function hydrateEntries(
   summaries: LeaderboardEntrySummary[],
   window: LeaderboardWindow,
   viewerUserId?: string | null,
+  scope: LeaderboardDataset["scope"] = "global",
 ) {
   if (summaries.length === 0) {
     return [];
@@ -445,11 +446,20 @@ async function hydrateEntries(
 
   const userMap = new Map(users.map((user) => [user.id, user]));
   const entries: LeaderboardEntry[] = [];
+  let hiddenAbove = 0;
 
   for (const summary of summaries) {
     const user = userMap.get(summary.userId);
 
-    if (!user) {
+    // 快照读出之后用户可能刚关闭公开资料，输出时复核权限。
+    // 私密用户仍可在自己的关注榜看到自己。
+    // 隐藏的行之后的名次顺延补上，榜单不留空号，第一名也始终存在。
+    if (
+      !user ||
+      (!user.usagePreference?.publicProfileEnabled &&
+        !(scope === "following" && user.id === viewerUserId))
+    ) {
+      hiddenAbove++;
       continue;
     }
 
@@ -459,7 +469,7 @@ async function hydrateEntries(
     };
 
     entries.push({
-      rank: summary.rank,
+      rank: summary.rank - hiddenAbove,
       userId: user.id,
       name: user.name,
       username: user.username,
@@ -653,12 +663,54 @@ function snapshotEntryToSummary(row: {
   };
 }
 
+/**
+ * Drop users who made their profile private after the summaries were read, and
+ * close the gaps they leave in the ranks.
+ *
+ * The summaries are computed outside the write transaction, so a visibility
+ * change in between would otherwise be written into a fresh snapshot and served
+ * until it expires. Locking the preference rows makes `updateUsagePreference`
+ * either commit first, so its change is seen here, or wait until this snapshot
+ * is written and then expire it. The lock has to come before the transaction
+ * touches the snapshot, because the preference update deletes snapshots while
+ * holding its row lock; taking them in the other order would deadlock.
+ */
+async function keepPublicSummaries(
+  tx: Prisma.TransactionClient,
+  summaries: LeaderboardEntrySummary[],
+) {
+  if (summaries.length === 0) {
+    return summaries;
+  }
+
+  const rows = await tx.$queryRaw<Array<{ userId: string }>>(Prisma.sql`
+    SELECT "userId" FROM "UsagePreference"
+    WHERE "userId" IN (${Prisma.join(summaries.map((summary) => summary.userId))})
+      AND "publicProfileEnabled" = true
+    FOR SHARE
+  `);
+  const visible = new Set(rows.map((row) => row.userId));
+
+  if (visible.size === summaries.length) {
+    return summaries;
+  }
+
+  const kept: LeaderboardEntrySummary[] = [];
+  for (const summary of summaries) {
+    if (visible.has(summary.userId)) {
+      kept.push({ ...summary, rank: kept.length + 1 });
+    }
+  }
+
+  return kept;
+}
+
 async function rebuildGlobalSnapshot(
   period: LeaderboardPeriod,
   metric: LeaderboardMetric,
   now: Date,
 ) {
-  const { window, summaries } = await computeGlobalSummaries({
+  const { window, summaries: computed } = await computeGlobalSummaries({
     period,
     metric,
     now,
@@ -666,7 +718,10 @@ async function rebuildGlobalSnapshot(
   });
   const snapshotMetric = toSnapshotMetric(metric);
 
-  const snapshot = await prisma.$transaction(async (tx) => {
+  const { snapshot, summaries } = await prisma.$transaction(async (tx) => {
+    // react-doctor-disable-next-line react-doctor/async-parallel -- the preference rows must be locked before the snapshot is touched
+    const summaries = await keepPublicSummaries(tx, computed);
+    // react-doctor-disable-next-line react-doctor/server-sequential-independent-await -- see keepPublicSummaries for the lock order
     const nextSnapshot = await tx.leaderboardSnapshot.upsert({
       where: {
         period_metric: {
@@ -713,7 +768,7 @@ async function rebuildGlobalSnapshot(
       });
     }
 
-    return nextSnapshot;
+    return { snapshot: nextSnapshot, summaries };
   });
 
   return {
@@ -1002,7 +1057,12 @@ async function getFollowingLeaderboard(input: {
         followTag,
         now,
       });
-    const entries = await hydrateEntries(summaries, window, input.viewerUserId);
+    const entries = await hydrateEntries(
+      summaries,
+      window,
+      input.viewerUserId,
+      "following",
+    );
 
     return toDataset({
       scope: "following",
@@ -1093,7 +1153,12 @@ async function getFollowingLeaderboard(input: {
     },
     [],
   );
-  const entries = await hydrateEntries(summaries, window, input.viewerUserId);
+  const entries = await hydrateEntries(
+    summaries,
+    window,
+    input.viewerUserId,
+    "following",
+  );
 
   return toDataset({
     scope: "following",
