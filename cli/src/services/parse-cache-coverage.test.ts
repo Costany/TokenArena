@@ -139,8 +139,9 @@ describe("listSourceFiles covers everything parse reads", () => {
     );
     // The subagent directory is skipped by the parser, so it must not appear in
     // the list either.
+    const subagentRecord = join(subagents, "session-1.json");
     writeFileSync(
-      join(subagents, "session-1.json"),
+      subagentRecord,
       JSON.stringify([{ id: "sub-1", messages: [] }]),
     );
 
@@ -155,5 +156,6 @@ describe("listSourceFiles covers everything parse reads", () => {
     for (const path of readPaths) {
       expect(listed).toContain(path);
     }
+    expect(listed).not.toContain(subagentRecord);
   });
 });
