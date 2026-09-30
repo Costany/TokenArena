@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readSqliteRowsReadonly } from "./sqlite";
+import { readSqliteRows, readSqliteRowsReadonly } from "./sqlite";
 
 const { DatabaseSync, closeProbe, close, prepare, all } = vi.hoisted(() => ({
   DatabaseSync: vi.fn(),
@@ -14,7 +14,19 @@ vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
   execFileSync: vi.fn(),
 }));
-vi.mock("node:sqlite", () => ({ DatabaseSync }));
+const importFailure = vi.hoisted(() => ({ error: null as Error | null }));
+vi.mock("node:sqlite", () => ({
+  DatabaseSync,
+  // A cached module's then export rejects dynamic import without Vitest wrapping
+  // a factory exception. Keep the original error code at the production boundary.
+  // biome-ignore lint/suspicious/noThenProperty: Intentional thenable to reject dynamic import in the coverage worker.
+  get then() {
+    const error = importFailure.error;
+    return error
+      ? (_resolve: unknown, reject: (reason: Error) => void) => reject(error)
+      : undefined;
+  },
+}));
 
 const originalEmitWarning = process.emitWarning;
 
@@ -37,10 +49,67 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  importFailure.error = null;
   expect(process.emitWarning).toBe(originalEmitWarning);
   vi.resetAllMocks();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+});
+
+describe("legacy SQLite CLI compatibility", () => {
+  it("keeps the existing CLI arguments for callers of readSqliteRows", async () => {
+    await import("node:sqlite");
+    importFailure.error = Object.assign(new Error("node:sqlite unavailable"), {
+      code: "ERR_UNKNOWN_BUILTIN_MODULE",
+    });
+    vi.mocked(execFileSync).mockReturnValue('[{"value":42}]');
+
+    expect(await readSqliteRows("usage.db", "SELECT 42")).toEqual([
+      { value: 42 },
+    ]);
+    expect(execFileSync).toHaveBeenCalledExactlyOnceWith(
+      "sqlite3",
+      ["-json", "usage.db", "SELECT 42"],
+      expect.any(Object),
+    );
+    expect(DatabaseSync).not.toHaveBeenCalled();
+  });
+});
+
+describe("readSqliteRowsReadonly in-process import rejection", () => {
+  it.each([
+    "ERR_UNKNOWN_BUILTIN_MODULE",
+    "ERR_ACCESS_DENIED",
+    undefined,
+  ])("handles import error code %s without opening a database", async (code) => {
+    // Resolve the factory while then is undefined; subsequent imports exercise
+    // Promise assimilation of the cached namespace in the coverage worker.
+    await import("node:sqlite");
+    const error = Object.assign(new Error("node:sqlite unavailable"), {
+      code,
+    });
+    importFailure.error = error;
+    vi.mocked(execFileSync).mockReturnValue('[{"value":42}]');
+
+    if (code === "ERR_UNKNOWN_BUILTIN_MODULE") {
+      expect(await readSqliteRowsReadonly("usage.db", "SELECT 42")).toEqual([
+        { value: 42 },
+      ]);
+      expect(execFileSync).toHaveBeenCalledExactlyOnceWith(
+        "sqlite3",
+        ["-readonly", "-json", "usage.db", "SELECT 42"],
+        expect.any(Object),
+      );
+    } else {
+      await expect(
+        readSqliteRowsReadonly("usage.db", "SELECT 42"),
+      ).rejects.toBe(error);
+      expect(execFileSync).not.toHaveBeenCalled();
+    }
+    expect(DatabaseSync).not.toHaveBeenCalled();
+    expect(closeProbe).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+  });
 });
 
 describe("readSqliteRowsReadonly capability checks", () => {

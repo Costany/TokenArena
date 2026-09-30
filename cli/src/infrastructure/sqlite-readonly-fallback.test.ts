@@ -83,4 +83,29 @@ describe("read-only sqlite3 fallback", () => {
       readSqliteRowsReadonly("usage.db", "SELECT 1"),
     ).rejects.toThrow();
   });
+
+  it("reports a useful fallback when missing executables have no error message", async () => {
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw Object.assign(new Error(""), { status: 127 });
+    });
+    await expect(
+      readSqliteRowsReadonly("usage.db", "SELECT 1"),
+    ).rejects.toThrow("Last error: not found");
+    expect(
+      vi.mocked(execFileSync).mock.calls.map(([command]) => command),
+    ).toEqual(["sqlite3", "sqlite3.exe"]);
+  });
+
+  it("does not mistake ENOENT in a SQL error message for a missing executable", async () => {
+    const error = Object.assign(new Error("SQL error near ENOENT"), {
+      status: 1,
+    });
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw error;
+    });
+    await expect(readSqliteRowsReadonly("usage.db", "SELECT 1")).rejects.toBe(
+      error,
+    );
+    expect(execFileSync).toHaveBeenCalledTimes(1);
+  });
 });

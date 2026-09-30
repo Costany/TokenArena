@@ -3,6 +3,9 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
+    // Windows process startup and first ICU use contend under an unbounded pool.
+    // Keep real subprocess/SQLite tests and their default timeouts intact.
+    maxWorkers: process.platform === "win32" ? 2 : undefined,
     include: ["src/**/*.test.ts"],
     passWithNoTests: true,
     coverage: {

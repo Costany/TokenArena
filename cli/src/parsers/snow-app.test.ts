@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SqliteQueryRows } from "../infrastructure/sqlite";
 import { useTempDirs } from "../testing/temp-dir";
 import { getParser } from "./registry";
 import { SnowAppParser } from "./snow-app";
@@ -187,6 +188,42 @@ describe("SnowAppParser", () => {
     ]).parser.parse();
     expect(local.buckets[0].bucketStart).toBe("2026-09-30T02:00:00.000Z");
     expect(offset.buckets).toEqual(local.buckets);
+  });
+
+  it("keeps an unambiguous local time before the DST overlap", async () => {
+    vi.stubEnv("TZ", "America/New_York");
+    const { parser } = parserFor([usage({ timestamp: "2026-11-01 00:15:00" })]);
+    expect((await parser.parse()).buckets[0].bucketStart).toBe(
+      "2026-11-01T04:00:00.000Z",
+    );
+  });
+
+  it("preserves root directory and absent optional text fallbacks", async () => {
+    const { parser } = parserFor([
+      usage({ directoryId: "local:/", model: null, sessionId: null }),
+    ]);
+    const result = await parser.parse();
+    expect(result.buckets[0]).toMatchObject({
+      project: "unknown",
+      model: "unknown",
+      totalTokens: 120,
+    });
+    expect(result.sessions).toEqual([]);
+  });
+
+  it("propagates non-ENOENT stat errors without querying", async () => {
+    const queryRowsMock = vi.fn(async () => [] as unknown[]);
+    const queryRows: SqliteQueryRows = async <T>() =>
+      (await queryRowsMock()) as T[];
+    const parser = new SnowAppParser({
+      dbPath: `invalid${String.fromCharCode(0)}.db`,
+      queryRows,
+    });
+    expect(() => parser.isInstalled()).toThrow();
+    await expect(parser.parse()).rejects.toMatchObject({
+      code: "ERR_INVALID_ARG_VALUE",
+    });
+    expect(queryRowsMock).not.toHaveBeenCalled();
   });
 
   it("defers malformed identity and message metadata", async () => {
