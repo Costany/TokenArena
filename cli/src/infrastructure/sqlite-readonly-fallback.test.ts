@@ -1,15 +1,37 @@
 import { execFileSync } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { readSqliteRowsWithCli } from "./sqlite";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readSqliteRowsReadonly } from "./sqlite";
 
+const { DatabaseSync, closeProbe } = vi.hoisted(() => ({
+  DatabaseSync: vi.fn(),
+  closeProbe: vi.fn(),
+}));
 vi.mock("node:child_process", () => ({ execFileSync: vi.fn() }));
+vi.mock("node:sqlite", () => ({ DatabaseSync }));
 
-// Exercise the external fallback independently of the Node version running Vitest.
-async function readSqliteRowsReadonly(path: string, query: string) {
-  return readSqliteRowsWithCli(path, query, true);
-}
+beforeEach(() => {
+  vi.stubEnv("TOKEN_ARENA_SQLITE3", "");
+  // Model early Node versions that import successfully but ignore readOnly.
+  DatabaseSync.mockImplementation(function OldDatabase(this: unknown) {
+    void this;
+    return { close: closeProbe };
+  });
+});
 
 afterEach(() => {
+  expect(DatabaseSync).toHaveBeenCalledWith(":memory:", expect.any(Object));
+  expect(DatabaseSync.mock.calls.every(([path]) => path === ":memory:")).toBe(
+    true,
+  );
+  expect(closeProbe).toHaveBeenCalledTimes(DatabaseSync.mock.calls.length);
+  for (const [, args] of vi.mocked(execFileSync).mock.calls) {
+    expect(args).toEqual([
+      "-readonly",
+      "-json",
+      "usage.db",
+      expect.any(String),
+    ]);
+  }
   vi.resetAllMocks();
   vi.unstubAllEnvs();
 });

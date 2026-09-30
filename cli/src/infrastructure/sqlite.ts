@@ -221,6 +221,21 @@ export async function readSqliteRowsReadonly<TRow>(
       return readSqliteRowsWithCli<TRow>(dbPath, query, true);
     }
 
+    // Early node:sqlite versions (e.g. Node 22.11 with --experimental-sqlite)
+    // silently ignore readOnly. Probe option recognition only in memory, never
+    // on the user's database. Memory databases themselves are always writable.
+    let supportsReadOnly = false;
+    const probe = new sqlite.DatabaseSync(":memory:", {
+      get readOnly() {
+        supportsReadOnly = true;
+        return false;
+      },
+    });
+    probe.close();
+    if (!supportsReadOnly) {
+      return readSqliteRowsWithCli<TRow>(dbPath, query, true);
+    }
+
     const db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
     try {
       return db.prepare(query).all();

@@ -1,7 +1,7 @@
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { aggregateToBuckets } from "../domain/aggregator";
+import { aggregateToBuckets, roundToHalfHour } from "../domain/aggregator";
 import { extractSessions } from "../domain/session-extractor";
 import type {
   ParseResult,
@@ -22,42 +22,41 @@ const DEFAULT_DB_PATH = join(homedir(), ".snowapp", "snowapp.db");
 // Never select content, raw_json, prompts, credentials, or conversation totals.
 // usage_records is the ONLY token ledger; status (including tool_calls, failed,
 // cancelled, compaction) does not determine whether a request consumed tokens.
-const SNAPSHOT_QUERY = `WITH message_order AS (
-  SELECT m.id, m.conversation_id, m.role, m.created_at,
-    ROW_NUMBER() OVER (
-      PARTITION BY m.conversation_id ORDER BY m.created_at, m.rowid
-    ) AS position
-  FROM chat_messages m
-)
-SELECT 'usage' AS kind, u.id, u.conversation_id AS sessionId,
-  COALESCE((SELECT d.path FROM workspace_directories d
-    WHERE d.directory_id = u.directory_id LIMIT 1), '') AS projectPath,
+const SNAPSHOT_QUERY = `SELECT 'usage' AS kind, u.id, u.conversation_id AS sessionId,
+  u.directory_id AS directoryId,
   u.model, u.created_at AS timestamp, '' AS role,
   u.input_tokens AS inputTokens, u.output_tokens AS outputTokens,
   u.cache_read_input_tokens AS cacheReadTokens,
-  u.cache_creation_input_tokens AS cacheCreationTokens
+  u.cache_creation_input_tokens AS cacheCreationTokens,
+  '' AS forkedFrom, 0 AS forkMessageCount
 FROM usage_records u
 UNION ALL
 SELECT 'message' AS kind, m.id, m.conversation_id AS sessionId,
-  COALESCE((SELECT d.path FROM workspace_directories d
-    WHERE d.directory_id = (SELECT u.directory_id FROM usage_records u
-      WHERE u.conversation_id = m.conversation_id
-      ORDER BY u.created_at, u.id LIMIT 1) LIMIT 1), '') AS projectPath,
+  (SELECT u.directory_id FROM usage_records u
+    WHERE u.conversation_id = m.conversation_id
+    ORDER BY u.created_at, u.id LIMIT 1) AS directoryId,
   '' AS model, m.created_at AS timestamp, m.role,
-  0 AS inputTokens, 0 AS outputTokens, 0 AS cacheReadTokens, 0 AS cacheCreationTokens
-FROM message_order m
+  0 AS inputTokens, 0 AS outputTokens, 0 AS cacheReadTokens, 0 AS cacheCreationTokens,
+  '' AS forkedFrom, 0 AS forkMessageCount
+FROM chat_messages m
 WHERE m.role IN ('user', 'assistant')
   AND EXISTS (SELECT 1 FROM usage_records u WHERE u.conversation_id = m.conversation_id)
-  AND m.position > COALESCE((SELECT c.fork_message_count FROM chat_conversations c
-    WHERE c.conversation_id = m.conversation_id AND c.forked_from_conversation_id != ''
-    LIMIT 1), 0)
+UNION ALL
+SELECT 'conversation' AS kind, c.conversation_id AS id, c.conversation_id AS sessionId,
+  '' AS directoryId, '' AS model, '' AS timestamp, '' AS role,
+  0 AS inputTokens, 0 AS outputTokens, 0 AS cacheReadTokens, 0 AS cacheCreationTokens,
+  c.forked_from_conversation_id AS forkedFrom, c.fork_message_count AS forkMessageCount
+FROM chat_conversations c
+WHERE EXISTS (SELECT 1 FROM usage_records u WHERE u.conversation_id = c.conversation_id)
 ORDER BY timestamp, kind, id`;
 
 interface SnowAppRow {
   kind?: unknown;
   id?: unknown;
   sessionId?: unknown;
-  projectPath?: unknown;
+  directoryId?: unknown;
+  forkedFrom?: unknown;
+  forkMessageCount?: unknown;
   model?: unknown;
   timestamp?: unknown;
   role?: unknown;
@@ -125,12 +124,61 @@ function parseTimestamp(value: unknown): Date {
       "Snow App contains an invalid local timestamp; scan deferred.",
     );
   }
+  // Match Snow CLI's supported era and reject offsets that cross its bounds.
+  if (
+    date.getTime() < Date.UTC(2020, 0, 1) ||
+    date.getTime() >= Date.UTC(2080, 0, 1)
+  ) {
+    throw new Error(
+      "Snow App timestamp is outside the supported range; scan deferred.",
+    );
+  }
+  // A local wall clock cannot distinguish the two occurrences of a repeated
+  // DST hour. Do not silently choose the earlier one.
+  if (!match[8]) {
+    const nextDay = new Date(date);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const overlapMinutes =
+      nextDay.getTimezoneOffset() - date.getTimezoneOffset();
+    if (overlapMinutes > 0) {
+      const later = new Date(date.getTime() + overlapMinutes * 60_000);
+      if (
+        later.getHours() === hour &&
+        later.getMinutes() === minute &&
+        later.getDate() === day
+      ) {
+        throw new Error(
+          "Snow App contains an ambiguous local timestamp; scan deferred.",
+        );
+      }
+    }
+  }
+  // The shared aggregator uses a local-time setter. Until it has a separately
+  // reviewed identity-compatible DST fix, defer instead of emitting a wrong key.
+  const elapsed = date.getTime() - roundToHalfHour(date).getTime();
+  if (elapsed < 0 || elapsed >= 30 * 60_000) {
+    throw new Error(
+      "Snow App timestamp cannot be bucketed safely across DST; scan deferred.",
+    );
+  }
   return date;
 }
 
 function projectName(value: unknown): string {
+  if (value === "") return "unknown";
+  // The request ledger preserves local:<absolute path> even after registration
+  // removal or relocation. Never use the mutable workspace_directories table.
+  if (
+    typeof value !== "string" ||
+    !/^local:(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(value)
+  ) {
+    throw new Error(
+      "Snow App contains an unsupported directory identity; scan deferred.",
+    );
+  }
   return (
-    text(value)
+    value
+      .slice("local:".length)
       .split(/[\\/]+/)
       .filter(Boolean)
       .at(-1) || "unknown"
@@ -170,7 +218,12 @@ export class SnowAppParser implements IParser {
     const seen = new Map<string, string>();
     for (const row of rows) {
       const id = text(row.id);
-      if (!id || (row.kind !== "usage" && row.kind !== "message")) {
+      if (
+        !id ||
+        (row.kind !== "usage" &&
+          row.kind !== "message" &&
+          row.kind !== "conversation")
+      ) {
         throw new Error(
           "Snow App contains an invalid record identity; scan deferred.",
         );
@@ -184,8 +237,22 @@ export class SnowAppParser implements IParser {
         continue;
       }
       seen.set(key, signature);
+      if (row.kind === "conversation") {
+        // No verified native fork ordering contract yet. Validate even when a
+        // conversation has no remaining messages; SQL filtering must not hide it.
+        if (
+          typeof row.forkedFrom !== "string" ||
+          row.forkedFrom !== "" ||
+          row.forkMessageCount !== 0
+        ) {
+          throw new Error(
+            "Snow App fork metadata is unsupported or invalid; scan deferred.",
+          );
+        }
+        continue;
+      }
       const sessionId = text(row.sessionId);
-      const project = projectName(row.projectPath);
+      const project = projectName(row.directoryId);
       if (row.kind === "message") {
         if (!sessionId || (row.role !== "user" && row.role !== "assistant")) {
           throw new Error(
@@ -230,10 +297,23 @@ export class SnowAppParser implements IParser {
       });
     }
     // Missing transcripts do not erase ledger buckets or invent user messages.
-    return {
-      buckets: aggregateToBuckets(entries),
-      sessions: extractSessions(events, entries),
-    };
+    const buckets = aggregateToBuckets(entries);
+    const sessions = extractSessions(events, entries);
+    if (
+      [...buckets, ...sessions].some(
+        (row) => !Number.isSafeInteger(row.totalTokens),
+      ) ||
+      sessions.some(
+        (row) =>
+          row.durationSeconds > 2_147_483_647 ||
+          row.activeSeconds > 2_147_483_647,
+      )
+    ) {
+      throw new Error(
+        "Snow App aggregate exceeds supported counts or duration; scan deferred.",
+      );
+    }
+    return { buckets, sessions };
   }
 }
 

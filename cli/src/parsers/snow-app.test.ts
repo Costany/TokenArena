@@ -14,7 +14,7 @@ function usage(overrides: Record<string, unknown> = {}) {
     id: "u1",
     sessionId: "s1",
     model: "model-a",
-    projectPath: "C:\\work\\Pisces",
+    directoryId: "local:C:\\work\\Pisces",
     timestamp: "2026-09-30 10:05:00",
     inputTokens: 100,
     outputTokens: 20,
@@ -28,7 +28,7 @@ function message(overrides: Record<string, unknown> = {}) {
     kind: "message",
     id: "m1",
     sessionId: "s1",
-    projectPath: "C:\\work\\Pisces",
+    directoryId: "local:C:\\work\\Pisces",
     timestamp: "2026-09-30 10:05:00",
     role: "assistant",
     ...overrides,
@@ -99,7 +99,7 @@ describe("SnowAppParser", () => {
     const { parser } = parserFor([
       usage({
         sessionId: "",
-        projectPath: "",
+        directoryId: "",
         model: "",
         inputTokens: 70,
         outputTokens: 0,
@@ -182,7 +182,7 @@ describe("SnowAppParser", () => {
     const offset = await parserFor([
       usage({
         timestamp: "2026-09-30T10:05:00+08:00",
-        projectPath: "/work/Pisces/",
+        directoryId: "local:/work/Pisces/",
       }),
     ]).parser.parse();
     expect(local.buckets[0].bucketStart).toBe("2026-09-30T02:00:00.000Z");
@@ -225,7 +225,7 @@ try {
 }
 
 describe.skipIf(!sqlite)("Snow App SQLite integration", () => {
-  it("reads WAL, excludes inherited fork/tool messages, and never adds message totals", async () => {
+  it("reads WAL and nonfork timing, excludes tool messages, and never adds message totals", async () => {
     if (!sqlite) return;
     const dbPath = join(temp(), "snowapp.db");
     const db = new sqlite.DatabaseSync(dbPath);
@@ -234,24 +234,19 @@ describe.skipIf(!sqlite)("Snow App SQLite integration", () => {
         CREATE TABLE usage_records(id TEXT PRIMARY KEY, conversation_id TEXT, directory_id TEXT, model TEXT,
           created_at TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_input_tokens INTEGER,
           cache_creation_input_tokens INTEGER, status TEXT, is_sub_agent INTEGER);
-        CREATE TABLE workspace_directories(directory_id TEXT, path TEXT);
         CREATE TABLE chat_conversations(conversation_id TEXT, forked_from_conversation_id TEXT, fork_message_count INTEGER);
         CREATE TABLE chat_messages(id TEXT PRIMARY KEY, conversation_id TEXT, role TEXT, created_at TEXT, input_tokens INTEGER);
-        INSERT INTO workspace_directories VALUES ('d1', '/work/Project');
-        INSERT INTO chat_conversations VALUES ('fork', 'parent', 3);
+        INSERT INTO chat_conversations VALUES ('ordinary', '', 0), ('child', '', 0);
         INSERT INTO chat_messages VALUES
-          ('m1','fork','user','2026-09-30 08:00:00',999999),
-          ('m2','fork','assistant','2026-09-30 08:00:01',999999),
-          ('m3','fork','tool','2026-09-30 08:00:02',999999),
-          ('m4','fork','user','2026-09-30 10:00:00',999999),
-          ('m5','fork','assistant','2026-09-30 10:00:05',999999),
-          ('m6','fork','tool','2026-09-30 10:00:06',999999),
-          ('m7','child','assistant','2026-09-30 10:00:07',999999);
+          ('m1','ordinary','user','2026-09-30 10:00:00',999999),
+          ('m2','ordinary','assistant','2026-09-30 10:00:05',999999),
+          ('m3','ordinary','tool','2026-09-30 10:00:06',999999),
+          ('m4','child','assistant','2026-09-30 10:00:07',999999);
         PRAGMA wal_checkpoint(TRUNCATE);
         INSERT INTO usage_records VALUES
-          ('u1','fork','d1','model','2026-09-30 10:00:05',100,20,70,10,'tool_calls',0),
-          ('u2','child','d1','model','2026-09-30 10:00:07',50,10,0,0,'completed',1),
-          ('u3','orphan','missing','model','2026-09-30 10:00:07',10,5,0,0,'cancelled',0);`);
+          ('u1','ordinary','local:/work/Project','model','2026-09-30 10:00:05',100,20,70,10,'tool_calls',0),
+          ('u2','child','local:/work/Project','model','2026-09-30 10:00:07',50,10,0,0,'completed',1),
+          ('u3','orphan','','model','2026-09-30 10:00:07',10,5,0,0,'cancelled',0);`);
       const before = readFileSync(dbPath);
       const result = await new SnowAppParser({ dbPath }).parse();
       expect(result.buckets.reduce((sum, b) => sum + b.totalTokens, 0)).toBe(
