@@ -29,6 +29,8 @@ const weekdayIndex: Record<string, number> = {
   Sat: 6,
 };
 const dateOnlyPattern = /^\d{4}-\d{2}-\d{2}$/;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 /**
  * Widest span a `custom` range may cover, in days (a leap year).
@@ -131,8 +133,31 @@ function getTimezoneOffsetMs(date: Date, timezone: string) {
   return asUtc - date.getTime();
 }
 
+function isSameWallTime(date: Date, parts: ZonedDateParts, timezone: string) {
+  const actual = toZonedParts(date, timezone);
+
+  return (
+    actual.year === parts.year &&
+    actual.month === parts.month &&
+    actual.day === parts.day &&
+    actual.hour === parts.hour &&
+    actual.minute === parts.minute &&
+    actual.second === parts.second
+  );
+}
+
+/**
+ * The instant a wall-clock time names in `timezone`.
+ *
+ * The offsets in effect a day either side cover any transition near the wall
+ * time. A time repeated when clocks go back resolves to its first occurrence,
+ * and a time skipped when clocks go forward resolves to the instant right after
+ * the gap, which is Temporal's "compatible" disambiguation. The first instant of
+ * a day whose midnight is skipped (Africa/Cairo, Asia/Beirut) is therefore the
+ * 01:00 that replaces it, not 23:00 of the previous day.
+ */
 function zonedDateTimeToUtc(parts: ZonedDateParts, timezone: string) {
-  let utcMs = Date.UTC(
+  const wallMs = Date.UTC(
     parts.year,
     parts.month - 1,
     parts.day,
@@ -140,70 +165,35 @@ function zonedDateTimeToUtc(parts: ZonedDateParts, timezone: string) {
     parts.minute,
     parts.second,
   );
-
-  for (let index = 0; index < 3; index += 1) {
-    const offsetMs = getTimezoneOffsetMs(new Date(utcMs), timezone);
-    const nextUtcMs =
-      Date.UTC(
-        parts.year,
-        parts.month - 1,
-        parts.day,
-        parts.hour,
-        parts.minute,
-        parts.second,
-      ) - offsetMs;
-
-    if (nextUtcMs === utcMs) {
-      break;
-    }
-
-    utcMs = nextUtcMs;
-  }
-
-  return new Date(utcMs);
-}
-
-function addToParts(
-  parts: ZonedDateParts,
-  input: { days?: number; hours?: number },
-): ZonedDateParts {
-  const next = new Date(
-    Date.UTC(
-      parts.year,
-      parts.month - 1,
-      parts.day,
-      parts.hour,
-      parts.minute,
-      parts.second,
-    ),
+  const offsetBefore = getTimezoneOffsetMs(new Date(wallMs - DAY_MS), timezone);
+  const offsetAfter = getTimezoneOffsetMs(new Date(wallMs + DAY_MS), timezone);
+  const matches = [wallMs - offsetBefore, wallMs - offsetAfter].filter(
+    (utcMs) => isSameWallTime(new Date(utcMs), parts, timezone),
   );
 
-  if (input.days) {
-    next.setUTCDate(next.getUTCDate() + input.days);
-  }
+  return new Date(
+    matches.length > 0 ? Math.min(...matches) : wallMs - offsetBefore,
+  );
+}
 
-  if (input.hours) {
-    next.setUTCHours(next.getUTCHours() + input.hours);
-  }
+function addDays(parts: ZonedDateParts, days: number): ZonedDateParts {
+  const next = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day + days),
+  );
 
   return {
+    ...parts,
     year: next.getUTCFullYear(),
     month: next.getUTCMonth() + 1,
     day: next.getUTCDate(),
-    hour: next.getUTCHours(),
-    minute: next.getUTCMinutes(),
-    second: next.getUTCSeconds(),
   };
 }
 
-function startOfZonedDay(date: Date, timezone: string) {
-  const parts = toZonedParts(date, timezone);
-
+/** First instant of the local day `days` after the one containing `date`. */
+function startOfZonedDay(date: Date, timezone: string, days = 0) {
   return zonedDateTimeToUtc(
     {
-      year: parts.year,
-      month: parts.month,
-      day: parts.day,
+      ...addDays(toZonedParts(date, timezone), days),
       hour: 0,
       minute: 0,
       second: 0,
@@ -212,19 +202,22 @@ function startOfZonedDay(date: Date, timezone: string) {
   );
 }
 
+/**
+ * Start of the local hour containing `date`.
+ *
+ * Subtracting the local minutes keeps the offset of `date`, so the first of two
+ * repeated hours does not turn into the second. When a transition moves the
+ * clock by less than an hour, the result can fall before the transition; it
+ * still identifies the local hour, which is all a bucket key needs.
+ */
 function startOfZonedHour(date: Date, timezone: string) {
   const parts = toZonedParts(date, timezone);
 
-  return zonedDateTimeToUtc(
-    {
-      year: parts.year,
-      month: parts.month,
-      day: parts.day,
-      hour: parts.hour,
-      minute: 0,
-      second: 0,
-    },
-    timezone,
+  return new Date(
+    date.getTime() -
+      parts.minute * 60_000 -
+      parts.second * 1000 -
+      date.getUTCMilliseconds(),
   );
 }
 
@@ -254,10 +247,7 @@ function dateOnlyToUtc(value: string, timezone: string, edge: "start" | "end") {
   }
 
   return new Date(
-    zonedDateTimeToUtc(
-      addToParts(startParts, { days: 1 }),
-      timezone,
-    ).getTime() - 1,
+    zonedDateTimeToUtc(addDays(startParts, 1), timezone).getTime() - 1,
   );
 }
 
@@ -318,14 +308,8 @@ export function resolveDashboardRange(
     };
   }
 
-  const startParts = toZonedParts(
-    startOfZonedDay(now, input.timezone),
-    input.timezone,
-  );
-  const days = preset === "7d" ? -6 : -29;
-
   return {
-    from: zonedDateTimeToUtc(addToParts(startParts, { days }), input.timezone),
+    from: startOfZonedDay(now, input.timezone, preset === "7d" ? -6 : -29),
     to: now,
     granularity: "day",
     preset,
@@ -343,35 +327,61 @@ export function getPreviousRange(range: DashboardRange): DashboardRange {
   };
 }
 
-export function groupByHourOrDay(range: DashboardRange, value: Date) {
+function formatBucketLabel(range: DashboardRange, value: Date) {
   const parts = toZonedParts(value, range.timezone);
+  const date = `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 
+  return range.granularity === "hour"
+    ? `${date} ${String(parts.hour).padStart(2, "0")}:00`
+    : date;
+}
+
+/**
+ * Key of the bucket that `value` falls in, matching `listRangeBuckets`.
+ *
+ * Days are keyed by their local date. Hours are keyed by the instant they
+ * start, because the same wall-clock hour happens twice when clocks go back.
+ */
+export function groupByHourOrDay(range: DashboardRange, value: Date) {
   if (range.granularity === "hour") {
-    return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")} ${String(parts.hour).padStart(2, "0")}:00`;
+    return startOfZonedHour(value, range.timezone).toISOString();
   }
 
-  return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+  return formatBucketLabel(range, value);
 }
 
 export function listRangeBuckets(range: DashboardRange) {
-  const buckets: Array<{ key: string; start: Date }> = [];
-  const step = range.granularity === "hour" ? "hour" : "day";
-  let cursor =
-    step === "hour"
-      ? startOfZonedHour(range.from, range.timezone)
-      : startOfZonedDay(range.from, range.timezone);
+  const buckets: Array<{ key: string; label: string; start: Date }> = [];
 
-  while (cursor.getTime() <= range.to.getTime()) {
-    buckets.push({
-      key: groupByHourOrDay(range, cursor),
-      start: cursor,
-    });
+  if (range.granularity === "hour") {
+    // Step an hour of elapsed time past each bucket's start. Every instant is
+    // keyed by the start of its local hour, and this reaches each of those
+    // starts in turn, also when clocks skip, repeat, or shift by 30 or 45
+    // minutes. The label comes from the probe rather than the key, which can
+    // precede a short hour.
+    for (
+      let probe = range.from;
+      probe.getTime() <= range.to.getTime();
+      probe = new Date(buckets[buckets.length - 1].start.getTime() + HOUR_MS)
+    ) {
+      const start = startOfZonedHour(probe, range.timezone);
+      buckets.push({
+        key: start.toISOString(),
+        label: formatBucketLabel(range, probe),
+        start,
+      });
+    }
 
-    const cursorParts = toZonedParts(cursor, range.timezone);
-    cursor = zonedDateTimeToUtc(
-      addToParts(cursorParts, step === "hour" ? { hours: 1 } : { days: 1 }),
-      range.timezone,
-    );
+    return buckets;
+  }
+
+  for (
+    let start = startOfZonedDay(range.from, range.timezone);
+    start.getTime() <= range.to.getTime();
+    start = startOfZonedDay(start, range.timezone, 1)
+  ) {
+    const key = formatBucketLabel(range, start);
+    buckets.push({ key, label: key, start });
   }
 
   return buckets;

@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.17.0](https://github.com/GuJi08233/TokenArena/compare/v0.16.6...v0.17.0) (2026-09-28)
+
+
+### Features
+
+* **cli:** extract Snow sessions and cache creation tokens ([1129cb5](https://github.com/GuJi08233/TokenArena/commit/1129cb58b2874134c2cb75578666a5d0e0792925))
+* **cli:** extract Snow sessions and cache creation tokens ([544d1e2](https://github.com/GuJi08233/TokenArena/commit/544d1e26d036d2e23181ef71da77476e85866d8f))
+
+
+### Bug Fixes
+
+* **cli:** count branched, duplicated and compacted Snow sessions once ([95a31a4](https://github.com/GuJi08233/TokenArena/commit/95a31a42e9fc95b15f6996e18b80a8b2695e555a))
+* **cli:** ignore implausible Snow timestamps that make uploads fail ([95a31a4](https://github.com/GuJi08233/TokenArena/commit/95a31a42e9fc95b15f6996e18b80a8b2695e555a))
+* **cli:** keep damaged Snow transcripts from blocking uploads ([#44](https://github.com/GuJi08233/TokenArena/issues/44)) ([95a31a4](https://github.com/GuJi08233/TokenArena/commit/95a31a42e9fc95b15f6996e18b80a8b2695e555a))
+* **cli:** keep Snow buckets on a stable project key ([34f6ed7](https://github.com/GuJi08233/TokenArena/commit/34f6ed72f3061e3b29ace03265b1d7632f3b5dd7))
+* **cli:** preserve Snow snapshots on incomplete scans ([b968fda](https://github.com/GuJi08233/TokenArena/commit/b968fda829a5e0a37d2d76d4b730a6b0d9f55f8b))
+* **cli:** stop counting Snow cache reads twice for OpenAI-format usage ([95a31a4](https://github.com/GuJi08233/TokenArena/commit/95a31a42e9fc95b15f6996e18b80a8b2695e555a))
+* **cli:** tolerate a plain ~/.snow file on Linux and macOS ([95a31a4](https://github.com/GuJi08233/TokenArena/commit/95a31a42e9fc95b15f6996e18b80a8b2695e555a))
+* **web:** handle DST ranges, profile privacy and initial preferences ([#42](https://github.com/GuJi08233/TokenArena/issues/42)) ([2d6b9ea](https://github.com/GuJi08233/TokenArena/commit/2d6b9ea3ba30107a74ef878cf28aa644fff1cd43))
+* **web:** keep repeated and off-grid DST hours apart in hourly trends ([2d6b9ea](https://github.com/GuJi08233/TokenArena/commit/2d6b9ea3ba30107a74ef878cf28aa644fff1cd43))
+* **web:** keep today in 7d and 30d trends in zones that skip midnight ([2d6b9ea](https://github.com/GuJi08233/TokenArena/commit/2d6b9ea3ba30107a74ef878cf28aa644fff1cd43))
+* **web:** let a concurrent first preference update succeed ([2d6b9ea](https://github.com/GuJi08233/TokenArena/commit/2d6b9ea3ba30107a74ef878cf28aa644fff1cd43))
+* **web:** recheck profile visibility when writing leaderboard snapshots ([2d6b9ea](https://github.com/GuJi08233/TokenArena/commit/2d6b9ea3ba30107a74ef878cf28aa644fff1cd43))
+
+
+### Performance Improvements
+
+* **cli:** attribute Snow usage in one time-ordered sweep ([95a31a4](https://github.com/GuJi08233/TokenArena/commit/95a31a42e9fc95b15f6996e18b80a8b2695e555a))
+
 ## [0.16.6](https://github.com/GuJi08233/TokenArena/compare/v0.16.5...v0.16.6) (2026-09-24)
 
 

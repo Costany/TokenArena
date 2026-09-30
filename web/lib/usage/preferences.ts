@@ -70,21 +70,28 @@ export async function updateUsagePreference(
     bio?: string | null;
   },
 ) {
+  // Create a missing row before the transaction. If another request creates it
+  // at the same moment, the unique violation aborts a PostgreSQL transaction,
+  // so the fallback read in `ensureUsagePreferenceWithDb` only works outside
+  // one.
+  await ensureUsagePreference(userId);
+
   return prisma.$transaction(async (tx) => {
-    const [existing, preference] = await Promise.all([
-      ensureUsagePreferenceWithDb(tx, userId),
-      tx.usagePreference.update({
-        where: { userId },
-        data: {
-          locale: input.locale,
-          theme: input.theme,
-          timezone: input.timezone,
-          projectMode: input.projectMode,
-          publicProfileEnabled: input.publicProfileEnabled,
-          bio: input.bio,
-        },
-      }),
-    ]);
+    const existing = await tx.usagePreference.findUniqueOrThrow({
+      where: { userId },
+    });
+    // react-doctor-disable-next-line react-doctor/server-sequential-independent-await -- the old visibility must be read before the update
+    const preference = await tx.usagePreference.update({
+      where: { userId },
+      data: {
+        locale: input.locale,
+        theme: input.theme,
+        timezone: input.timezone,
+        projectMode: input.projectMode,
+        publicProfileEnabled: input.publicProfileEnabled,
+        bio: input.bio,
+      },
+    });
 
     if (
       input.publicProfileEnabled !== undefined &&

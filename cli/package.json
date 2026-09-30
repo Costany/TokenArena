@@ -1,6 +1,6 @@
 {
   "name": "@yishiguji/tokenarena",
-  "version": "0.16.6",
+  "version": "0.17.0",
   "type": "module",
   "description": "Collect and sync local AI coding CLI usage data",
   "license": "MIT",
