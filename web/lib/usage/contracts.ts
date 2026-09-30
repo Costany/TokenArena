@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { supportedLocales } from "@/lib/i18n";
 import { themeModes } from "@/lib/theme";
+import { normalizeUsageSource } from "./sources";
 import {
   dashboardPresets,
   projectModes,
@@ -140,7 +141,7 @@ export const dashboardQuerySchema = z
     to: dashboardDateParamSchema.optional(),
     apiKeyId: z.string().trim().min(1).optional(),
     deviceId: z.string().trim().min(1).optional(),
-    source: z.string().trim().min(1).optional(),
+    source: z.string().trim().min(1).transform(normalizeUsageSource).optional(),
     model: z.string().trim().min(1).optional(),
     projectKey: z.string().trim().min(1).optional(),
   })

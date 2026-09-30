@@ -14,6 +14,7 @@ import { resolveDashboardRange } from "@/lib/usage/date-range";
 import { formatDateInput } from "@/lib/usage/format";
 import { getUsagePreference } from "@/lib/usage/preferences";
 import type { UsageShareCardPersona } from "@/lib/usage/share-card";
+import { normalizeUsageSource } from "@/lib/usage/sources";
 import type { AchievementAwardSource } from "../../generated/prisma/client";
 import { getArenaLevelFromScore } from "./arena-level";
 import { achievementDefinitionMap } from "./catalog";
@@ -145,7 +146,7 @@ function resolveCurrentPersona(input: {
   return "steady_builder";
 }
 
-function buildAllTimeMetrics(input: {
+export function buildAllTimeMetrics(input: {
   timezone: string;
   buckets: Array<{
     bucketStart: Date;
@@ -221,7 +222,11 @@ function buildAllTimeMetrics(input: {
     addTimelineValue(tokenValuesByTimestamp, at, normalized.totalTokens);
     addTimelineValue(costValuesByTimestamp, at, estimatedCostUsd);
     recordDistinctTimelineKey(firstModelTimestamp, bucket.model, at);
-    recordDistinctTimelineKey(firstToolTimestamp, bucket.source, at);
+    recordDistinctTimelineKey(
+      firstToolTimestamp,
+      normalizeUsageSource(bucket.source),
+      at,
+    );
     recordDistinctTimelineKey(firstProjectTimestamp, bucket.projectKey, at);
     recordDistinctTimelineKey(firstDeviceTimestamp, bucket.deviceId, at);
     activityDayKeys.add(formatDateInput(bucket.bucketStart, input.timezone));

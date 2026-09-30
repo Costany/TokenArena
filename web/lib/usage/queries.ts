@@ -14,6 +14,11 @@ import {
   groupByHourOrDay,
   listRangeBuckets,
 } from "./date-range";
+import {
+  getUsageSourceFilter,
+  getUsageSourceLabel,
+  normalizeUsageSource,
+} from "./sources";
 import type {
   ActivityTrendPoint,
   BreakdownRow,
@@ -84,7 +89,7 @@ function applyBucketFilters<T extends Record<string, unknown>>(
     ...input,
     ...(filters.apiKeyId ? { apiKeyId: filters.apiKeyId } : {}),
     ...(filters.deviceId ? { deviceId: filters.deviceId } : {}),
-    ...(filters.source ? { source: filters.source } : {}),
+    ...(filters.source ? { source: getUsageSourceFilter(filters.source) } : {}),
     ...(filters.model ? { model: filters.model } : {}),
     ...(filters.projectKey ? { projectKey: filters.projectKey } : {}),
   };
@@ -99,7 +104,7 @@ function applySessionFilters<T extends Record<string, unknown>>(
     ...input,
     ...(filters.apiKeyId ? { apiKeyId: filters.apiKeyId } : {}),
     ...(filters.deviceId ? { deviceId: filters.deviceId } : {}),
-    ...(filters.source ? { source: filters.source } : {}),
+    ...(filters.source ? { source: getUsageSourceFilter(filters.source) } : {}),
     ...(filters.projectKey ? { projectKey: filters.projectKey } : {}),
   };
 }
@@ -710,7 +715,11 @@ function buildBreakdowns(
       bucket.deviceId,
       deviceLabels.get(bucket.deviceId) ?? bucket.deviceId,
     );
-    const toolRow = ensureBreakdownRow(byTool, bucket.source, bucket.source);
+    const toolRow = ensureBreakdownRow(
+      byTool,
+      normalizeUsageSource(bucket.source),
+      getUsageSourceLabel(bucket.source),
+    );
     const modelRow = ensureBreakdownRow(byModel, bucket.model, bucket.model);
     const projectRow = ensureBreakdownRow(
       byProject,
@@ -736,7 +745,11 @@ function buildBreakdowns(
       session.deviceId,
       deviceLabels.get(session.deviceId) ?? session.deviceId,
     );
-    const toolRow = ensureBreakdownRow(byTool, session.source, session.source);
+    const toolRow = ensureBreakdownRow(
+      byTool,
+      normalizeUsageSource(session.source),
+      getUsageSourceLabel(session.source),
+    );
     const projectRow = ensureBreakdownRow(
       byProject,
       session.projectKey,
@@ -1113,8 +1126,10 @@ export async function getFilterOptions(
       value: device.deviceId,
       label: deviceLabels.get(device.deviceId) ?? device.hostname,
     })),
-    sources: sourceRows
-      .map((row) => ({ value: row.source, label: row.source }))
+    sources: Array.from(
+      new Set(sourceRows.map((row) => normalizeUsageSource(row.source))),
+    )
+      .map((source) => ({ value: source, label: getUsageSourceLabel(source) }))
       .sort((left, right) => left.label.localeCompare(right.label)),
     models: modelRows
       .map((row) => ({ value: row.model, label: row.model }))

@@ -30,6 +30,7 @@ import {
   formatTokenCount,
   formatUsdAmount,
 } from "@/lib/usage/format";
+import { getUsageSourceLabel } from "@/lib/usage/sources";
 import type { UsageSessionRow } from "@/lib/usage/types";
 import { CollapsibleSection } from "./collapsible-section";
 
@@ -148,7 +149,7 @@ export function SessionsSection({
                       </div>
                     </TableCell>
                     <TableCell className="align-top font-medium">
-                      {session.source}
+                      {getUsageSourceLabel(session.source)}
                     </TableCell>
                     <TableCell
                       className="max-w-[200px] align-top"

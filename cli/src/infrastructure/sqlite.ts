@@ -103,7 +103,9 @@ async function readSqliteRowsWithBuiltin<TRow>(
         DatabaseSync: new (location: string) => SqliteDatabaseSync<TRow>;
       };
 
-      const immutableLocation = `${pathToFileURL(dbPath).href}?mode=ro&immutable=1`;
+      const immutableLocation = `${
+        pathToFileURL(dbPath).href
+      }?mode=ro&immutable=1`;
       const locations = [dbPath, immutableLocation];
       let lastError: unknown = null;
 
@@ -149,7 +151,11 @@ async function readSqliteRowsWithBuiltin<TRow>(
   }
 }
 
-function readSqliteRowsWithCli<TRow>(dbPath: string, query: string): TRow[] {
+export function readSqliteRowsWithCli<TRow>(
+  dbPath: string,
+  query: string,
+  readOnly = false,
+): TRow[] {
   const candidates = [
     process.env.TOKEN_ARENA_SQLITE3,
     "sqlite3",
@@ -160,7 +166,8 @@ function readSqliteRowsWithCli<TRow>(dbPath: string, query: string): TRow[] {
 
   for (const command of candidates) {
     try {
-      const output = execFileSync(command, ["-json", dbPath, query], {
+      const args = [...(readOnly ? ["-readonly"] : []), "-json", dbPath, query];
+      const output = execFileSync(command, args, {
         encoding: "utf-8",
         maxBuffer: 100 * 1024 * 1024,
         timeout: 30000,
@@ -175,7 +182,7 @@ function readSqliteRowsWithCli<TRow>(dbPath: string, query: string): TRow[] {
     } catch (err) {
       lastError = err as Error;
       const nodeError = err as NodeJS.ErrnoException & { status?: number };
-      if (nodeError.status === 127 || nodeError.message?.includes("ENOENT")) {
+      if (nodeError.status === 127 || nodeError.code === "ENOENT") {
         continue;
       }
 
@@ -184,8 +191,43 @@ function readSqliteRowsWithCli<TRow>(dbPath: string, query: string): TRow[] {
   }
 
   throw new Error(
-    `sqlite3 CLI not found. Install sqlite3 or set TOKEN_ARENA_SQLITE3 to its full path. Last error: ${lastError?.message || "not found"}`,
+    `sqlite3 CLI not found. Install sqlite3 or set TOKEN_ARENA_SQLITE3 to its full path. Last error: ${
+      lastError?.message || "not found"
+    }`,
   );
+}
+
+/** Read a live database without writes or an immutable fallback that loses WAL. */
+export async function readSqliteRowsReadonly<TRow>(
+  dbPath: string,
+  query: string,
+): Promise<TRow[]> {
+  return withSuppressedSqliteWarning(async () => {
+    const sqliteModuleId = "node:sqlite";
+    let sqlite: {
+      DatabaseSync: new (
+        location: string,
+        options: { readOnly: boolean },
+      ) => SqliteDatabaseSync<TRow>;
+    };
+    try {
+      sqlite = await import(sqliteModuleId);
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "ERR_UNKNOWN_BUILTIN_MODULE"
+      ) {
+        throw error;
+      }
+      return readSqliteRowsWithCli<TRow>(dbPath, query, true);
+    }
+
+    const db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return db.prepare(query).all();
+    } finally {
+      db.close();
+    }
+  });
 }
 
 export async function readSqliteRows<TRow>(

@@ -28,6 +28,7 @@ import {
   resolveDashboardRange,
 } from "@/lib/usage/date-range";
 import { formatDateInput } from "@/lib/usage/format";
+import { getUsageSourceLabel, normalizeUsageSource } from "@/lib/usage/sources";
 import type { DashboardRange } from "@/lib/usage/types";
 import { Prisma } from "../../generated/prisma/client";
 import type { FollowTag } from "./follow-tags";
@@ -568,13 +569,21 @@ async function loadPublicProfileUsageSnapshot(input: {
 
     return { name: row.model, totalTokens: tokens.totalTokens };
   });
+  const toolTotals = new Map<string, number>();
+  for (const row of sourceRows) {
+    const source = normalizeUsageSource(row.source);
+    toolTotals.set(
+      source,
+      (toolTotals.get(source) ?? 0) + tokenCountToNumber(row._sum.totalTokens),
+    );
+  }
 
   return {
     activityHeatmap,
     topTools: buildTopItems(
-      sourceRows.map((row) => ({
-        name: row.source,
-        totalTokens: tokenCountToNumber(row._sum.totalTokens),
+      Array.from(toolTotals, ([source, totalTokens]) => ({
+        name: getUsageSourceLabel(source),
+        totalTokens,
       })),
     ),
     topModels: buildTopItems(modelTotals),

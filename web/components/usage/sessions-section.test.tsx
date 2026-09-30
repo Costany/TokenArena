@@ -32,8 +32,9 @@ vi.mock("next-intl", () => ({
           "table.cache": "Cache",
           "pagination.prev": "Previous",
           "pagination.next": "Next",
-          "pagination.info":
-            `${values?.from ?? ""}–${values?.to ?? ""} of ${values?.total ?? ""}`.trim(),
+          "pagination.info": `${values?.from ?? ""}–${values?.to ?? ""} of ${
+            values?.total ?? ""
+          }`.trim(),
         }[key] ?? key
       );
     },
@@ -65,6 +66,20 @@ describe("SessionsSection", () => {
       primaryModel: "claude-sonnet-4-20250514",
     },
   ];
+
+  it.each([
+    "snow",
+    "snow-app",
+  ])("displays %s as Snow without mutating the API row", (source) => {
+    const row = Object.freeze({ ...sessions[0], source });
+    const markup = renderToStaticMarkup(
+      <TooltipProvider>
+        <SessionsSection sessions={[row]} timezone="UTC" />
+      </TooltipProvider>,
+    );
+    expect(markup).toContain(">Snow</td>");
+    expect(row.source).toBe(source);
+  });
 
   it("can be collapsed with defaultOpen={false}", () => {
     const markup = renderToStaticMarkup(

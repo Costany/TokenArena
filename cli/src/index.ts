@@ -21,6 +21,7 @@ import "./parsers/cline.js";
 import "./parsers/kiro.js";
 import "./parsers/roo-code.js";
 import "./parsers/snow.js";
+import "./parsers/snow-app.js";
 import "./parsers/cursor.js";
 import "./parsers/zcode.js";
 import "./parsers/qodercli.js";
